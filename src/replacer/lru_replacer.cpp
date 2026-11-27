@@ -17,10 +17,17 @@ bool LRUReplacer::victim(frame_id_t* frame_id) {
     // 它能够避免死锁发生，其构造函数能够自动进行上锁操作，析构函数会对互斥量进行解锁操作，保证线程安全。
     std::scoped_lock lock{latch_};  //  如果编译报错可以替换成其他lock
 
-    // Todo:
-    //  利用lru_replacer中的LRUlist_,LRUHash_实现LRU策略
-    //  选择合适的frame指定为淘汰页面,赋值给*frame_id
+    if(LRUlist_.empty()){//如果候选的集合为空，那么没办法选帧淘汰
+        return false;
+    }
 
+    auto it=LRUlist_.begin();//取出候选集合的第一个，作为移除对象
+    *frame_id=*it;//给传入的参数赋值，赋值为移除的帧
+
+    //执行删除操作
+    LRUhash_.erase(*it);
+    LRUlist_.erase(it);
+    //*frame_id=*it;
     return true;
 }
 
@@ -30,9 +37,13 @@ bool LRUReplacer::victim(frame_id_t* frame_id) {
  */
 void LRUReplacer::pin(frame_id_t frame_id) {
     std::scoped_lock lock{latch_};
-    // Todo:
-    // 固定指定id的frame
-    // 在数据结构中移除该frame
+    auto it=LRUhash_.find(frame_id);//找到候选队列里面frame_id的帧的迭代器
+    if(it!=LRUhash_.end()){//判断这个frame_id的帧是不是在待淘汰集合中
+
+        //如果找到的话，就把它移除出待淘汰集合
+        LRUlist_.erase(it->second);
+        LRUhash_.erase(it);
+    }
 }
 
 /**
@@ -40,9 +51,16 @@ void LRUReplacer::pin(frame_id_t frame_id) {
  * @param {frame_id_t} frame_id 取消固定的frame的id
  */
 void LRUReplacer::unpin(frame_id_t frame_id) {
-    // Todo:
-    //  支持并发锁
-    //  选择一个frame取消固定
+    std::scoped_lock lock{latch_};
+
+    if(LRUhash_.find(frame_id)!=LRUhash_.end()){
+        //如果已经在待淘汰集合中，那么不用管它
+        return ;
+    }
+    //如果不在待淘汰集合中，那么就把frame_id这个帧加入待淘汰集合里面，并且在映射表里面记录
+    LRUlist_.push_back(frame_id);
+    auto it=std::prev(LRUlist_.end());
+    LRUhash_[frame_id]=it;
 }
 
 /**

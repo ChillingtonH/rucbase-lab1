@@ -1,5 +1,7 @@
 // Copyright (c) 2023-2027 Renmin University of China
 // SPDX-License-Identifier: MulanPSL-2.0
+#include <fcntl.h>   // open, O_CREAT, O_EXCL, O_RDWR
+#include <cerrno>    // errno, EEXIST
 
 #include "storage/disk_manager.h"
 
@@ -27,10 +29,18 @@ DiskManager::DiskManager() = default;
  * @param {int} num_bytes 要写入磁盘的数据大小
  */
 void DiskManager::write_page(int fd, page_id_t page_no, const char* offset, int num_bytes) {
-    // Todo:
-    // 1.lseek()定位到文件头，通过(fd,page_no)可以定位指定页面及其在磁盘文件中的偏移量
-    // 2.调用write()函数
-    // 注意write返回值与num_bytes不等时 throw InternalError("DiskManager::write_page Error");
+    //第 page_no页在文件中的起始偏移
+    off_t file_offset=static_cast<off_t>(page_no)*PAGE_SIZE;
+    if(lseek(fd,file_offset,SEEK_SET)<0){
+        throw UnixError();
+    }
+
+    //写入不足说明磁盘空间不足或出现I/O错误
+    ssize_t bytes_written=write(fd,offset,num_bytes);
+    if(bytes_written!=num_bytes){
+        throw InternalError("DiskManager::write_page Error");
+    }
+    return ;
 }
 
 /**
@@ -41,10 +51,20 @@ void DiskManager::write_page(int fd, page_id_t page_no, const char* offset, int 
  * @param {int} num_bytes 读取的数据量大小
  */
 void DiskManager::read_page(int fd, page_id_t page_no, char* offset, int num_bytes) {
-    // Todo:
-    // 1.lseek()定位到文件头，通过(fd,page_no)可以定位指定页面及其在磁盘文件中的偏移量
-    // 2.调用read()函数
-    // 注意read返回值与num_bytes不等时，throw InternalError("DiskManager::read_page Error");
+    //这里计算第page_no页在文件中的起始偏移量
+    off_t file_offset=static_cast<off_t>(page_no)*PAGE_SIZE;
+    if(lseek(fd,file_offset,SEEK_SET)<0){
+        throw UnixError();
+    }
+
+    //offset是内存缓冲区地址，不是文件偏移
+    ssize_t bytes_read=read(fd,offset,num_bytes);
+
+    //如果读到的字节数少于请求量，说明读到了文件末尾之外
+    if(bytes_read!=num_bytes){
+        throw InternalError("DiskManager::read_page Error");
+    }
+    return ;
 }
 
 /**
@@ -104,9 +124,22 @@ bool DiskManager::is_file(const std::string& path) {
  * @param {string} &path
  */
 void DiskManager::create_file(const std::string& path) {
-    // Todo:
-    // 调用open()函数，使用O_CREAT模式
-    // 注意不能重复创建相同文件
+    if(is_file(path)){//先检查这个文件是不是已经有了，因为不能创建一个已经有的文件
+        throw FileExistsError(path);//如果已经有这个文件了，就抛错误
+    }
+
+    //这一句创建文件，0644意思是所有者读写，其他用户只读
+    int fd=open(path.c_str(),O_CREAT|O_EXCL|O_RDWR,0644);
+
+    if(fd<0){//这句话是因为哪怕判断了is_file(path)，也有可能在int fd=open()之前被其他进程抢占
+        if(errno==EEXIST){
+            throw FileExistsError(path);
+        }
+        throw UnixError();
+    }
+    if(close(fd)<0){//创建文件之后立即关闭，不要长期占用文件描述符
+        throw UnixError();
+    }
 }
 
 /**
@@ -114,9 +147,19 @@ void DiskManager::create_file(const std::string& path) {
  * @param {string} &path 文件所在路径
  */
 void DiskManager::destroy_file(const std::string& path) {
-    // Todo:
-    // 调用unlink()函数
-    // 注意不能删除未关闭的文件
+    if(!is_file(path)){
+        throw FileNotFoundError(path);
+    }
+
+    //如果文件仍然是打开的状态，那么不能在这种状态下删除它
+    if(path2fd_.contains(path)){
+        throw FileNotClosedError(path);
+    }
+
+    //这里的unlink只是删除目录项，已经打开的文件描述符仍然有效
+    if(unlink(path.c_str())<0){
+        throw UnixError();
+    }
 }
 
 /**
@@ -125,10 +168,23 @@ void DiskManager::destroy_file(const std::string& path) {
  * @param {string} &path 文件所在路径
  */
 int DiskManager::open_file(const std::string& path) {
-    // Todo:
-    // 调用open()函数，使用O_RDWR模式
-    // 注意不能重复打开相同文件，并且需要更新文件打开列表
-    return -1;
+    if(path2fd_.contains(path)){//这张映射表里面存着已经打开的文件，假如说已经打开，那不能再打开
+        throw FileNotClosedError(path);
+    }
+    if(!is_file(path)){
+        throw FileNotFoundError(path);
+    }
+    int fd=open(path.c_str(),O_RDWR);
+    if(fd<0){
+        throw UnixError();
+    }
+    if(fd>=MAX_FD){//fd2pageno_是以fd为下标的定长数组，超过MAX_FD无法登记
+        (void)close(fd);
+        throw InternalError("file descriptor exceeds MAX_FD");
+    }
+    path2fd_[path]=fd;//双向登记
+    fd2path_[fd]=path;//双向登记
+    return fd;
 }
 
 /**
@@ -136,9 +192,20 @@ int DiskManager::open_file(const std::string& path) {
  * @param {int} fd 打开的文件的文件句柄
  */
 void DiskManager::close_file(int fd) {
-    // Todo:
-    // 调用close()函数
-    // 注意不能关闭未打开的文件，并且需要更新文件打开列表
+    auto it=fd2path_.find(fd);
+    //关闭未打开的文件属于调用错误
+    if(it==fd2path_.end()){
+        throw FileNotOpenError(fd);
+    }
+    //先取出路径，因为close之后fd可能被系统复用，但path2fd_还需要这个键
+    std::string path=it->second;
+    if(close(fd)<0){
+        throw UnixError();
+    }
+    //两张表同时清理
+    fd2path_.erase(it);
+    path2fd_.erase(path);
+    return ;
 }
 
 /**
